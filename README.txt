@@ -35,11 +35,3 @@ CHANGES IN 1.0.1
 
 CHANGES IN 1.1.0
 - Ledger now records loot gold and quest reward gold (new Loot and Quest filters).
-
-RENAMED TO FOREVER LEDGER
-The add-on was called Account Ledger. Delete the old AccountLedger folder from Interface/AddOns
-(running both at once makes them fight over /ledger).
-To keep your saved data: before first launch, in your WTF/Account/<ACCOUNT>/SavedVariables folder,
-copy AccountLedger.lua to ForeverLedger.lua. Or, in the old version, /ledger export, then in this
-one /ledger import. Linked characters need linking again, and BOTH accounts must be updated
-(sync messages use a new channel name, so old and new versions cannot talk to each other).
