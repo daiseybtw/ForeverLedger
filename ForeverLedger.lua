@@ -20,6 +20,7 @@ local state = {
     lastReply = {},
     lastSender = {},
     lastSend = 0,
+    peers = {},
 }
 
 ------------------------------------------------------------------------
@@ -202,11 +203,99 @@ local function findLocalChar(arg)
     if n > 1 then return nil, "ambiguous" end
 end
 
+-- Factions: Forever forbids cross-faction play (no trade, mail or auction house between them), so the
+-- lists show your current character's faction by default. DB.factionView is "mine", "other" or "all".
+local function myFaction()
+    return UnitFactionGroup and (UnitFactionGroup("player")) or nil
+end
+
+-- Rulesets (Normal, PvP, RP, Hardcore) replace realms on Forever, and each is a separate world: PvE Horde
+-- and PvP Horde can't interact. The realm part of every character's key is what the game reports as its
+-- realm/ruleset, so c.realm is filled from that and used to keep the lists to the current ruleset.
+local function realmFromKey(key)
+    return key and key:match("^[^%-]+%-(.+)$") or nil
+end
+
+local function backfillRealms()
+    for key, c in pairs(DB.chars) do c.realm = realmFromKey(key) end
+end
+
+local function myRealm()
+    return GetRealmName and GetRealmName() or nil
+end
+
+-- The realm string can differ between characters that are on the same ruleset (the beta had names like
+-- "Classic Beta PvE 2" next to "Classic Beta PvE 1"), so the ruleset is read from the words in it
+-- rather than comparing the whole string. Anything unrecognised falls back to the exact string.
+function LX.rulesetOf(realm)
+    if not realm or realm == "" then return nil end
+    local l = realm:lower()
+    if l:find("hardcore", 1, true) then return "Hardcore" end
+    if l:find("pvp", 1, true) then return "PvP" end
+    if l:find("roleplay", 1, true) or l:find("%f[%a]rp%f[%A]") then return "RP" end
+    if l:find("pve", 1, true) or l:find("normal", 1, true) then return "Normal" end
+    return (l:gsub("[^%w]+", ""))
+end
+
+local function factionShown(c)
+    if not (DB and DB.allRulesets) and c.realm and myRealm() then
+        local a, b = LX.rulesetOf(c.realm), LX.rulesetOf(myRealm())
+        if a and b and a ~= b then return false end
+    end
+    local v = DB and DB.factionView or "mine"
+    if v == "all" or not c.faction then return true end
+    local mine = myFaction()
+    if not mine then return true end
+    if v == "other" then return c.faction ~= mine end
+    return c.faction == mine
+end
+
+local function factionTag(c)
+    if c.faction == "Alliance" then return "|cff4d8dff[A]|r " end
+    if c.faction == "Horde" then return "|cffe5483d[H]|r " end
+    return ""
+end
+
+local function factionViewText()
+    local v = DB and DB.factionView or "mine"
+    local mine = myFaction()
+    if v == "all" then return "Both factions" end
+    if v == "other" then
+        return (mine == "Alliance" and "Horde" or (mine == "Horde" and "Alliance" or "Other faction")) .. " (other)"
+    end
+    return (mine or "Your faction") .. (mine and " (yours)" or "")
+end
+
+local function cycleFactionView(to)
+    local order = { mine = "other", other = "all", all = "mine" }
+    DB.factionView = to or order[DB.factionView or "mine"] or "mine"
+end
+
 -- a trusted (linked) character, found by canonical name; old links held only a first name
+-- Only one character per account can be online at a time, so linking ONE character of the other account
+-- has to cover all of them: any character we have synced from that same account is trusted too (their
+-- names reached us through the link, and whisper sender names are verified by the game).
+local function trustedAccounts()
+    local set = {}
+    for key, c in pairs(DB.chars) do
+        if c.remote and c.account and c.account ~= DB.account then
+            local n = canon(nameOf(key))
+            if DB.trusted[n] or DB.trusted[n:match("^(%S+)") or n] then set[c.account] = true end
+        end
+    end
+    return set
+end
+
 local function trustedKey(who)
     if DB.trusted[who] then return who end
     local first = who:match("^(%S+)")
     if first and DB.trusted[first] then return first end
+    local accts = trustedAccounts()
+    if next(accts) then
+        for key, c in pairs(DB.chars) do
+            if c.remote and accts[c.account or ""] and canon(nameOf(key)) == who then return who end
+        end
+    end
 end
 
 -- addon whispers need a target name; Forever puts the last name where other clients put the realm,
@@ -290,11 +379,12 @@ local function recordHistory(c)
 end
 
 local function updateSelf(fullScan, trustMoney)
-    if not DB then return end
+    if not DB or state.leaving then return end
     local key = myKey()
     local c = DB.chars[key] or {}
     DB.chars[key] = c
     c.account = DB.account
+    c.realm = myRealm()
     c.class = select(2, UnitClass("player"))
     c.faction = UnitFactionGroup("player")
     c.level = UnitLevel("player")
@@ -483,6 +573,7 @@ end
 -- Professions + secondary skills (name, rank, max). The skill list hides entries under collapsed
 -- headers, so we expand everything, read it, and collapse again what the player had collapsed.
 local function scanProfessions()
+    if state.leaving then return false end
     if not DB then return false end
     if SkillFrame and SkillFrame.IsShown and SkillFrame:IsShown() then return false end -- leave the skills window alone
     if skillNum() == 0 then return false end -- skills not loaded yet (or no skill API on this client)
@@ -717,7 +808,7 @@ local function sharedLines()
     end
     for id, t in pairs(DB.todos or {}) do
         out[#out + 1] = string.format("K^%s^%d^%d^%d^%s^%s", id, t.done and 1 or 0, t.del and 1 or 0, t.ts or 0,
-            cleanText(t.char or "", 24), cleanText(t.text, 80))
+            cleanText(t.char or "", 30), cleanText(t.text, 80))
     end
     return out
 end
@@ -1010,7 +1101,7 @@ local function handleLine(line, source)
             hist = merged, ledger = s.ledger, played = s.played,
             account = s.account, class = s.class, faction = s.faction,
             level = s.level, money = s.money, time = s.time,
-            items = s.items, remote = true, synced = time(),
+            items = s.items, remote = true, synced = time(), realm = realmFromKey(key),
             roles = s.roles, auctions = s.auctions, profs = s.profs or {}, assigned = s.assigned or {}, auctionList = s.alist,
         }
         return "committed"
@@ -1022,12 +1113,33 @@ end
 ------------------------------------------------------------------------
 local outq, ticker = {}, nil
 
+-- in-memory log of sync traffic, for /ledger synclog
+LX.sync = { log = {}, out = 0, inn = 0, bad = 0 }
+function LX.logSync(dir, peer, msg)
+    local L = LX.sync
+    if dir == "out" then L.out = L.out + 1 elseif dir == "in" then L.inn = L.inn + 1 else L.bad = L.bad + 1 end
+    local fn = date or (os and os.date)
+    local arrow = dir == "out" and "->" or (dir == "in" and "<-" or "<- REJECTED")
+    local m = tostring(msg or "")
+    local mode, kind = m:match("^(%a)%^(%a)")
+    local shown = m:gsub("[%c|]", "?")
+    if #shown > 110 then shown = shown:sub(1, 107) .. "..." end
+    L.log[#L.log + 1] = string.format("%s %s %s  [%s/%s %db]  %s", fn and fn("%H:%M:%S", time()) or "", arrow, tostring(peer), mode or "?", kind or "?", #m, shown)
+    while #L.log > 300 do table.remove(L.log, 1) end
+end
+
 local function rawSend(msg, to)
+    LX.logSync("out", to, msg)
     local send = (C_ChatInfo and C_ChatInfo.SendAddonMessage) or SendAddonMessage
     if send then send(PREFIX, msg, "WHISPER", to) end
 end
 
 local function pump()
+    if state.leaving then
+        outq = {}
+        if ticker then ticker:Cancel() ticker = nil end
+        return
+    end
     local m = table.remove(outq, 1)
     if not m then
         if ticker then ticker:Cancel() ticker = nil end
@@ -1051,6 +1163,152 @@ local function syncTo(target, mode)
     for _, line in ipairs(sharedLines()) do
         enqueue(target, mode .. "^" .. line)
     end
+end
+
+-- Real-time sync -----------------------------------------------------------------
+-- A linked character that has been heard from recently counts as online. While one is, a poll every
+-- few seconds notices when the current character or the shared notes/to-dos changed and pushes just that
+-- (never more often than every 45s). With nobody online, a one-line hello goes out every few minutes so
+-- a character that logs in later is found quickly.
+do
+local LIVE_POLL, LIVE_MIN_GAP, PEER_TTL, PING_EVERY = 15, 45, 1200, 180
+local live = { sig = nil, sharedSig = nil, lastPush = -999, lastPing = -999, lastFull = 0 }
+LX.SYNC_CHOICES = { 1, 2, 5, 10, 15, 30, 0 } -- minutes; 0 = off
+function LX.syncEvery()
+    local v = DB and DB.syncEvery
+    if v == nil then v = 5 end
+    return v
+end
+
+local function mySignature()
+    local c = DB.chars[myKey()]
+    if not c then return "" end
+    local n, sum = 0, 0
+    for id, cnt in pairs(c.items or {}) do
+        n = n + 1
+        sum = (sum + (tonumber(id) or 0) * (tonumber(cnt) or 0)) % 1000003
+    end
+    local profs = 0
+    for _, p in ipairs(c.profs or {}) do profs = profs + (p.rank or 0) end
+    local led = c.ledger
+    local last = led and led[#led]
+    return table.concat({
+        c.money or 0, c.level or 0, n, sum, profs, table.concat(c.roles or {}, ","), #(c.assigned or {}),
+        c.auctions and c.auctions.n or 0, c.auctions and c.auctions.value or 0, led and #led or 0,
+        last and (last.m .. "/" .. last.t) or "", c.faction or "",
+    }, "|")
+end
+
+local function sharedSignature()
+    local n, sum = 0, 0
+    for _, z in pairs(DB.zones or {}) do
+        n = n + 1 + #(z.notes or {})
+        sum = (sum + (z.ts or 0) + (z.rating or 0)) % 1000000007
+    end
+    for _, t in pairs(DB.todos or {}) do
+        n = n + 1
+        sum = (sum + (t.ts or 0)) % 1000000007
+    end
+    return n .. ":" .. sum
+end
+
+function live.peers()
+    local out, now = {}, GetTime()
+    for lower, at in pairs(state.peers) do
+        if now - at < PEER_TTL and state.lastSender[lower] then
+            out[#out + 1] = state.lastSender[lower]
+        end
+    end
+    return out
+end
+
+function live.push()
+    local peers = live.peers()
+    if #peers == 0 then return false end
+    updateSelf(false)
+    local key = myKey()
+    local c = DB.chars[key]
+    if not c then return false end
+    local lines = charLines(key, c)
+    local shared = sharedSignature()
+    local sendShared = shared ~= live.sharedSig
+    state.lastSend = GetTime()
+    for _, target in ipairs(peers) do
+        for _, l in ipairs(lines) do enqueue(target, "R^" .. l) end
+        if sendShared then
+            for _, l in ipairs(sharedLines()) do enqueue(target, "R^" .. l) end
+        end
+    end
+    live.sig, live.sharedSig, live.lastPush = mySignature(), shared, GetTime()
+    state.livePushes = (state.livePushes or 0) + 1
+    return true
+end
+
+function live.ping()
+    live.lastPing = GetTime()
+    state.lastSend = GetTime()
+    updateSelf(false)
+    local key = myKey()
+    local c = DB.chars[key]
+    if not c then return end
+    local header = charLines(key, c)[1]
+    local me = canon(selfName())
+    local sent, n = {}, 0
+    local function hello(lower, display)
+        if lower == me or sent[lower] or n >= 8 then return end
+        sent[lower] = true
+        n = n + 1
+        enqueue(state.lastSender[lower] or whisperName(display), "D^" .. header)
+    end
+    for lower, display in pairs(DB.trusted) do hello(lower, display) end
+    -- the linked character may be offline while another character of that account is on
+    local accts = trustedAccounts()
+    for key, rc in pairs(DB.chars) do
+        if rc.remote and accts[rc.account or ""] then hello(canon(nameOf(key)), nameOf(key)) end
+    end
+end
+
+function live.tick()
+    if state.leaving or not DB or DB.liveSync == false or not state.entered then return end
+    if next(DB.trusted) == nil then return end
+    local now = GetTime()
+    if #live.peers() == 0 then
+        if now - live.lastPing > PING_EVERY then live.ping() end
+        return
+    end
+    -- every X minutes: send everything (all characters on this account plus notes/to-dos), changed or not
+    local every = LX.syncEvery()
+    if every > 0 and now - live.lastFull >= every * 60 then
+        live.lastFull = now
+        updateSelf(false)
+        for _, target in ipairs(live.peers()) do syncTo(target, "R") end
+        live.sig, live.sharedSig, live.lastPush = mySignature(), sharedSignature(), now
+        state.fullSyncs = (state.fullSyncs or 0) + 1
+        return
+    end
+    if now - live.lastPush < LIVE_MIN_GAP then return end
+    if mySignature() ~= live.sig or sharedSignature() ~= live.sharedSig then live.push() end
+end
+
+-- called whenever a message from a linked character arrives
+function live.heard(who, name)
+    local first = state.peers[who] == nil
+    state.peers[who] = GetTime()
+    if first then
+        chat("live sync: " .. (name or DB.trusted[who] or who):gsub("%-", " ") .. " is online. Changes now sync automatically.")
+        -- the sync that introduced us already carried everything, so only later changes need pushing
+        live.sig, live.sharedSig = mySignature(), sharedSignature()
+    end
+end
+
+function live.start()
+    if live.ticker or not C_Timer or not C_Timer.NewTicker then return end
+    live.lastFull = GetTime()
+    -- the first poll is quick, so a first push after login does not wait a full interval
+    live.ticker = C_Timer.NewTicker(LIVE_POLL, function() live.tick() end)
+end
+
+LX.live = live
 end
 
 local function syncAll()
@@ -1099,7 +1357,7 @@ end
 local function buildMoveRows()
     local rows = {}
     local keys = {}
-    for key in pairs(DB.chars) do keys[#keys + 1] = key end
+    for key, c in pairs(DB.chars) do if factionShown(c) then keys[#keys + 1] = key end end
     table.sort(keys)
     for _, wkey in ipairs(keys) do
         local w = DB.chars[wkey]
@@ -1110,7 +1368,7 @@ local function buildMoveRows()
         if #cats > 0 then
             local labels = {}
             for _, r in ipairs(cats) do labels[#labels + 1] = CATEGORIES[r].label end
-            rows[#rows + 1] = { header = true, left = nameOf(wkey) .. " stocks: " .. table.concat(labels, ", "), right = "" }
+            rows[#rows + 1] = { header = true, left = factionTag(w) .. nameOf(wkey) .. " stocks: " .. table.concat(labels, ", "), right = "" }
             local found = false
             for _, ckey in ipairs(keys) do
                 local c = DB.chars[ckey]
@@ -1126,7 +1384,7 @@ local function buildMoveRows()
                     if total > 0 then
                         found = true
                         rows[#rows + 1] = {
-                            left = "  " .. classColor(c.class) .. nameOf(ckey) .. "|r |cff888888@" .. (c.account or "?") .. "  (" .. kinds .. " types)|r",
+                            left = "  " .. factionTag(c) .. classColor(c.class) .. nameOf(ckey) .. "|r |cff888888@" .. (c.account or "?") .. "  (" .. kinds .. " types)|r",
                             right = total .. " items",
                         }
                     end
@@ -1148,7 +1406,7 @@ local function buildAuctionRows(query)
     local rows = { { sub = true, left = "|cff888888Active auctions as last loaded at the auction house. Prices are the buyout as the game reports it.|r", right = "" } }
     local q = (query or ""):lower()
     local keys = {}
-    for key in pairs(DB.chars) do keys[#keys + 1] = key end
+    for key, c in pairs(DB.chars) do if factionShown(c) then keys[#keys + 1] = key end end
     table.sort(keys, function(a, b)
         local aa, ab = DB.chars[a].account or "", DB.chars[b].account or ""
         if aa ~= ab then return aa < ab end
@@ -1168,7 +1426,7 @@ local function buildAuctionRows(query)
         if #shown > 0 or (q == "" and count > 0) then
             any = true
             table.sort(shown, function(x, y) return x.name < y.name end)
-            rows[#rows + 1] = { header = true, left = nameOf(key) .. "  @" .. (c.account or "?"), right = count .. " listed" }
+            rows[#rows + 1] = { header = true, left = factionTag(c) .. nameOf(key) .. "  @" .. (c.account or "?"), right = count .. " listed" }
             for _, it in ipairs(shown) do
                 rows[#rows + 1] = {
                     left = "      " .. it.name .. (it.a.qty > 1 and ("  x" .. it.a.qty) or ""),
@@ -1191,7 +1449,7 @@ local function buildMaterialRows(query)
     local rows = { { sub = true, left = "|cff888888Trade goods in bags and bank, as last seen on each character.|r", right = "" } }
     local q = (query or ""):lower()
     local keys = {}
-    for key in pairs(DB.chars) do keys[#keys + 1] = key end
+    for key, c in pairs(DB.chars) do if factionShown(c) then keys[#keys + 1] = key end end
     table.sort(keys, function(a, b)
         local aa, ab = DB.chars[a].account or "", DB.chars[b].account or ""
         if aa ~= ab then return aa < ab end
@@ -1216,7 +1474,7 @@ local function buildMaterialRows(query)
             any = true
             rows[#rows + 1] = {
                 header = true,
-                left = nameOf(key) .. "  @" .. (c.account or "?"),
+                left = factionTag(c) .. nameOf(key) .. "  @" .. (c.account or "?"),
                 right = types .. (types == 1 and " type" or " types"),
             }
             for _, g in ipairs(TRADE_GROUP_ORDER) do
@@ -1247,7 +1505,7 @@ local LEDGER_TAG = { v = "|cffd9a441Vendor|r", p = "|cff66ccefPlayer|r", a = "|c
 local function ledgerEntries(filter, q)
     local all = {}
     for key, c in pairs(DB.chars) do
-        for _, e in ipairs(c.ledger or {}) do
+        for _, e in ipairs(factionShown(c) and c.ledger or {}) do
             if (filter == "all" or e.k == filter)
                 and (q == "" or e.d:lower():find(q, 1, true) or nameOf(key):lower():find(q, 1, true)) then
                 all[#all + 1] = { e = e, key = key, c = c }
@@ -1288,7 +1546,7 @@ function ui.buildLedgerRows(query)
             end
             headerRow.net = headerRow.net + e.m
             rows[#rows + 1] = {
-                left = string.format("|cff8a93a3%s|r  %s  %s%s|r  %s", fn("%H:%M", e.t), LEDGER_TAG[e.k] or "", classColor(item.c.class), nameOf(item.key), e.d),
+                left = string.format("|cff8a93a3%s|r  %s  %s%s|r  %s", fn("%H:%M", e.t), LEDGER_TAG[e.k] or "", factionTag(item.c) .. classColor(item.c.class), nameOf(item.key), e.d),
                 right = e.m ~= 0 and deltaStr(e.m) or "",
             }
         end
@@ -1320,7 +1578,7 @@ local function buildRows(query)
     if query and query ~= "" then
         local q, seen, hits = query:lower(), {}, {}
         for _, c in pairs(DB.chars) do
-            for id in pairs(c.items or {}) do
+            for id in pairs(factionShown(c) and c.items or {}) do
                 if not seen[id] then
                     seen[id] = true
                     local name = itemName(id)
@@ -1335,7 +1593,7 @@ local function buildRows(query)
             if i > 40 then break end
             local owners, total = {}, 0
             for key, c in pairs(DB.chars) do
-                local n = c.items and c.items[it.id]
+                local n = factionShown(c) and c.items and c.items[it.id]
                 if n and n > 0 then
                     owners[#owners + 1] = { key = key, c = c, n = n }
                     total = total + n
@@ -1345,7 +1603,7 @@ local function buildRows(query)
             rows[#rows + 1] = { header = true, left = it.name, right = tostring(total) }
             for _, o in ipairs(owners) do
                 rows[#rows + 1] = {
-                    left = "  " .. classColor(o.c.class) .. nameOf(o.key) .. "|r |cff888888(" .. (o.c.account or "?") .. ")|r",
+                    left = "  " .. factionTag(o.c) .. classColor(o.c.class) .. nameOf(o.key) .. "|r |cff888888(" .. (o.c.account or "?") .. ")|r",
                     right = tostring(o.n),
                 }
             end
@@ -1357,10 +1615,15 @@ local function buildRows(query)
     end
 
     local groups, labels = {}, {}
+    local hidden = 0
     for key, c in pairs(DB.chars) do
-        local a = c.account or "Other"
-        if not groups[a] then groups[a] = {} labels[#labels + 1] = a end
-        table.insert(groups[a], { key = key, c = c })
+        if factionShown(c) then
+            local a = c.account or "Other"
+            if not groups[a] then groups[a] = {} labels[#labels + 1] = a end
+            table.insert(groups[a], { key = key, c = c })
+        else
+            hidden = hidden + 1
+        end
     end
     table.sort(labels)
     for _, label in ipairs(labels) do
@@ -1372,7 +1635,7 @@ local function buildRows(query)
         for _, e in ipairs(list) do
             local c = e.c
             rows[#rows + 1] = {
-                left = "  " .. classColor(c.class) .. nameOf(e.key) .. "|r |cff888888L" .. (c.level or "?")
+                left = "  " .. factionTag(c) .. classColor(c.class) .. nameOf(e.key) .. "|r |cff888888L" .. (c.level or "?")
                     .. "  @" .. (c.account or "?") .. "|r" .. roleTag(c),
                 right = moneyStr(c.money),
             }
@@ -1386,7 +1649,10 @@ local function buildRows(query)
         end
     end
     if #rows == 0 then
-        rows[1] = { left = "|cff888888Nothing tracked yet.|r", right = "" }
+        rows[1] = { left = hidden > 0 and "|cff888888Nothing tracked for this faction yet.|r" or "|cff888888Nothing tracked yet.|r", right = "" }
+    end
+    if hidden > 0 then
+        rows[#rows + 1] = { sub = true, left = "|cff6b7280" .. hidden .. " character" .. (hidden == 1 and "" or "s") .. " hidden by the faction / ruleset buttons at the top.|r", right = "" }
     end
     return rows, grand
 end
@@ -1489,7 +1755,9 @@ local MILESTONES = { 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 2
 
 local function totalMoney()
     local t = 0
-    for _, c in pairs(DB.chars) do t = t + (c.money or 0) end
+    for _, c in pairs(DB.chars) do
+        if factionShown(c) then t = t + (c.money or 0) end
+    end
     return t
 end
 
@@ -1500,6 +1768,7 @@ local function wealthSeries(n)
     local list, have = {}, {}
     local first = today
     for _, c in pairs(DB.chars) do
+      if factionShown(c) then
         local days = {}
         for d in pairs(c.hist or {}) do
             days[#days + 1] = d
@@ -1508,6 +1777,7 @@ local function wealthSeries(n)
         end
         table.sort(days)
         list[#list + 1] = { c = c, days = days }
+      end
     end
     local function valueAt(e, d)
         local c, days = e.c, e.days
@@ -1550,6 +1820,7 @@ local function wealthStats()
     st.chars, st.accounts, st.ahN, st.ahChars, st.goods = 0, {}, 0, 0, 0
     st.richest = nil
     for key, c in pairs(DB.chars) do
+      if factionShown(c) then
         st.chars = st.chars + 1
         st.accounts[c.account or "?"] = true
         if c.auctions and c.auctions.n > 0 then st.ahN = st.ahN + c.auctions.n st.ahChars = st.ahChars + 1 end
@@ -1557,6 +1828,7 @@ local function wealthStats()
             if tradeGroup(id) then st.goods = st.goods + cnt end
         end
         if not st.richest or (c.money or 0) > (st.richest.c.money or 0) then st.richest = { key = key, c = c } end
+      end
     end
     st.nAccounts = 0
     for _ in pairs(st.accounts) do st.nAccounts = st.nAccounts + 1 end
@@ -1905,6 +2177,7 @@ local function refreshPlay()
     if not p then return end
     local rows, total, missing = {}, 0, 0
     for key, c in pairs(DB.chars) do
+      if factionShown(c) then
         local secs = playedSeconds(key, c)
         if secs then
             rows[#rows + 1] = { key = key, c = c, secs = secs }
@@ -1912,6 +2185,7 @@ local function refreshPlay()
         else
             missing = missing + 1
         end
+      end
     end
     table.sort(rows, function(a, b)
         if a.secs ~= b.secs then return a.secs > b.secs end
@@ -1945,7 +2219,7 @@ local function refreshPlay()
         local e = rows[i]
         local row = p.rows[i]
         if e then
-            row.name:SetText(classColor(e.c.class) .. nameOf(e.key) .. "|r |cff8a93a3L" .. (e.c.level or "?") .. "  @" .. (e.c.account or "?") .. "|r")
+            row.name:SetText(factionTag(e.c) .. classColor(e.c.class) .. nameOf(e.key) .. "|r |cff8a93a3L" .. (e.c.level or "?") .. "  @" .. (e.c.account or "?") .. "|r")
             row.bar:SetWidth(math.max(2, 300 * e.secs / math.max(1, maxSecs)))
             row.time:SetText(fmtDuration(e.secs))
             local h = e.secs / 3600
@@ -2633,9 +2907,25 @@ LX.mapState = wm
 end -- world map overlay
 
 function refreshUI()
+    if state.leaving then return end
     if state.mapRefresh then state.mapRefresh() end
     if not ui.frame or not ui.frame:IsShown() then return end
-    if ui.headTotal then ui.headTotal:SetText("|cff8a93a3All characters|r  " .. moneyStr(totalMoney())) end
+    if ui.headTotal then
+        local v = DB.factionView or "mine"
+        ui.headTotal:SetText("|cff8a93a3" .. (v == "all" and "All characters" or "Characters shown") .. "|r  " .. moneyStr(totalMoney()))
+    end
+    if ui.autoBtn then
+        local e = LX.syncEvery()
+        ui.autoBtn.txt:SetText(e > 0 and ("Auto-sync: every " .. e .. " min") or "Auto-sync: off")
+    end
+    if ui.rulesetBtn then
+        ui.rulesetBtn.txt:SetText(DB.allRulesets and "|cffffd700All rulesets|r" or "This ruleset")
+    end
+    if ui.factionBtn then
+        local f = (DB.factionView or "mine") == "all" and "" or (((DB.factionView or "mine") == "mine") and myFaction() or ((myFaction() == "Alliance") and "Horde" or "Alliance"))
+        local col = f == "Alliance" and "|cff4d8dff" or (f == "Horde" and "|cffe5483d" or "|cffffffff")
+        ui.factionBtn.txt:SetText(col .. factionViewText() .. "|r")
+    end
     local page = ui.refreshers[ui.mode]
     if page then
         page()
@@ -2718,6 +3008,18 @@ local function showText(title, text, acceptLabel, onAccept)
     tf:Show()
     tf.eb:SetFocus()
     if text and text ~= "" then tf.eb:HighlightText() end
+end
+
+function LX.showSyncLog()
+    local L = LX.sync
+    local head = string.format("Sync traffic this session: %d sent, %d received, %d rejected (sender not linked).\n"
+        .. "-> sent   <- received   [mode/kind size]   R=live push, D=login/manual sync. Kinds: C header, I items, P professions,\n"
+        .. "A assigned profs, L auctions, N item names, H gold history, Y time played, G ledger, Z zone notes, K to-dos, E end of character.\n\n",
+        L.out, L.inn, L.bad)
+    local body = #L.log > 0 and table.concat(L.log, "\n") or "(nothing yet: sync traffic appears here as it happens)"
+    showText("Sync log (newest at the bottom)", head .. body, "Close")
+    -- scroll to the newest line
+    if ui.textBox and ui.textBox.SetCursorPosition then pcall(ui.textBox.SetCursorPosition, ui.textBox, #head + #body) end
 end
 
 local function doExport()
@@ -2867,6 +3169,16 @@ local function createUI()
     ui.headTotal = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     ui.headTotal:SetPoint("TOPRIGHT", -98, -16)
     ui.headTotal:SetJustifyH("RIGHT")
+    ui.factionBtn = flatButton(f, "", 150, 22, function()
+        cycleFactionView()
+        refreshUI()
+    end)
+    ui.factionBtn:SetPoint("TOPLEFT", 160, -10)
+    ui.rulesetBtn = flatButton(f, "", 112, 22, function()
+        DB.allRulesets = not DB.allRulesets
+        refreshUI()
+    end)
+    ui.rulesetBtn:SetPoint("TOPLEFT", 316, -10)
 
     -- one button per view
     ui.tabs = {}
@@ -2966,6 +3278,16 @@ local function createUI()
     end)
     footer("Export", 106, doExport)
     footer("Import", 196, showImport)
+    ui.autoBtn = flatButton(f, "", 150, 24, function()
+        local cur, nxt = LX.syncEvery(), 1
+        for i, v in ipairs(LX.SYNC_CHOICES) do
+            if v == cur then nxt = i % #LX.SYNC_CHOICES + 1 break end
+        end
+        DB.syncEvery = LX.SYNC_CHOICES[nxt]
+        refreshUI()
+    end)
+    ui.autoBtn:SetPoint("BOTTOMLEFT", 288, 14)
+    footer("Sync log", 446, function() LX.showSyncLog() end)
 
     f:SetScript("OnShow", refreshUI)
     ui.range = ui.range or 30
@@ -3425,7 +3747,11 @@ notFoundPat = notFoundPat:gsub("%%s", "(.+)")
 local function systemFilter(_, _, msg)
     if DB and GetTime() - state.lastSend < 20 then
         local who = msg:match(notFoundPat)
-        if who and trustedKey(canon(who)) then return true end
+        local tk = who and trustedKey(canon(who))
+        if tk then
+            state.peers[tk] = nil
+            return true
+        end
     end
     return false
 end
@@ -3449,6 +3775,11 @@ local function help()
     print("  /ledger auctions [text] : every character's active auctions")
     print("  /ledger materials [text] : every character's trade goods, grouped by type")
     print("  /ledger wealth : total wealth chart, growth and milestones")
+    print("  /ledger synclog [chat N|clear] : see the sync messages sent and received between accounts")
+    print("  /ledger syncevery <minutes>|off : full sync to online linked characters on a timer (default 5)")
+    print("  /ledger live on|off : real-time sync between linked characters that are online (default on)")
+    print("  /ledger ruleset this|all : only characters on your current ruleset (default), or every ruleset")
+    print("  /ledger faction mine|other|all : which faction's characters the lists show (default: yours)")
     print("  /ledger tx [text] : transaction ledger (vendors, trades, mail, auction house)")
     print("  /ledger map : zone map with ratings and notes;  /ledger note <text> adds a note where you stand")
     print("  /ledger mapoverlay : show or hide your notes and zone colours on the world map (Ctrl+click a zone map to add a note)")
@@ -3484,6 +3815,37 @@ SlashCmdList["FOREVERLEDGER"] = function(msg)
     elseif cmd == "debug" then
         local function yn(v) return v and "yes" or "NO" end
         chat("diagnostics (send me this if something isn't working):")
+        do
+            local nc, ni, nl, nh = 0, 0, 0, 0
+            for _, c in pairs(DB.chars) do
+                nc = nc + 1
+                for _ in pairs(c.items or {}) do ni = ni + 1 end
+                nl = nl + #(c.ledger or {})
+                for _ in pairs(c.hist or {}) do nh = nh + 1 end
+            end
+            local nn = 0
+            for _ in pairs(DB.itemNames or {}) do nn = nn + 1 end
+            print(string.format("  saved data: %d characters, %d item rows, %d ledger lines, %d history days, %d item names; add-on memory ~%d KB",
+                nc, ni, nl, nh, nn, math.floor(collectgarbage("count"))))
+        end
+        do
+            local names, now = {}, GetTime()
+            for lower, at in pairs(state.peers) do names[#names + 1] = (state.lastSender[lower] or DB.trusted[lower] or lower) .. " " .. math.floor(now - at) .. "s ago" end
+            print("  real-time sync: " .. (DB.liveSync == false and "OFF" or "on") .. ", online linked characters: " .. (#names > 0 and table.concat(names, ", ") or "none heard yet") .. ", live pushes this session: " .. (state.livePushes or 0) .. ", full sync every " .. (LX.syncEvery() > 0 and (LX.syncEvery() .. " min") or "never") .. " (" .. (state.fullSyncs or 0) .. " this session)")
+        end
+        do
+            local seen, order = {}, {}
+            for _, c in pairs(DB.chars) do
+                local r = c.realm or "?"
+                if not seen[r] then seen[r] = 0 order[#order + 1] = r end
+                seen[r] = seen[r] + 1
+            end
+            table.sort(order)
+            local parts = {}
+            for _, r in ipairs(order) do parts[#parts + 1] = "'" .. r .. "' x" .. seen[r] .. " (" .. tostring(LX.rulesetOf(r)) .. ")" end
+            print("  realm names across your characters: " .. table.concat(parts, ", "))
+        end
+        print("  ruleset/realm as the game reports it: '" .. tostring(myRealm()) .. "' = " .. tostring(LX.rulesetOf(myRealm())) .. " (the filter compares the ruleset word in it: Normal/PvE, PvP, RP, Hardcore), showing " .. (DB.allRulesets and "all rulesets" or "this ruleset only"))
         print("  bag API: C_Container " .. yn(C_Container and C_Container.GetContainerItemInfo) .. ", legacy " .. yn(GetContainerItemInfo))
         print("  item type lookup: C_Item " .. yn(C_Item and C_Item.GetItemInfoInstant) .. ", legacy " .. yn(GetItemInfoInstant))
         print("  skills API: C_SkillInfo " .. yn(C_SkillInfo and C_SkillInfo.GetSkillLineInfo) .. ", legacy " .. yn(GetSkillLineInfo) .. ", skill lines " .. skillNum())
@@ -3544,6 +3906,16 @@ SlashCmdList["FOREVERLEDGER"] = function(msg)
         local name = titleCase(arg)
         DB.trusted[canon(name)] = nil
         chat("unlinked " .. name .. ".")
+    elseif cmd == "ruleset" then
+        local v = arg:lower()
+        if v == "all" then DB.allRulesets = true elseif v == "this" or v == "mine" then DB.allRulesets = false end
+        chat("showing " .. (DB.allRulesets and "characters from ALL rulesets" or ("only characters on your current ruleset (" .. tostring(myRealm()) .. ")")) .. ". (/ledger ruleset this or all)")
+        refreshUI()
+    elseif cmd == "faction" then
+        local v = arg:lower()
+        if v == "mine" or v == "other" or v == "all" then cycleFactionView(v) end
+        chat("showing: " .. factionViewText() .. ". (/ledger faction mine, other or all, or use the button at the top of the window.)")
+        refreshUI()
     elseif cmd == "whisperstyle" then
         local v = arg:lower()
         if v == "dash" or v == "space" then
@@ -3552,9 +3924,39 @@ SlashCmdList["FOREVERLEDGER"] = function(msg)
         else
             chat("whisper style is '" .. (DB.whisperStyle or "space") .. "'. Use /ledger whisperstyle dash or space if syncing doesn't reach the other account. It is normally learnt automatically.")
         end
+    elseif cmd == "synclog" then
+        local v = arg:lower()
+        if v == "clear" then
+            LX.sync.log, LX.sync.out, LX.sync.inn, LX.sync.bad = {}, 0, 0, 0
+            chat("sync log cleared.")
+        elseif v:match("^chat") then
+            local n = tonumber(v:match("%d+")) or 15
+            local L = LX.sync
+            chat(string.format("sync traffic: %d sent, %d received, %d rejected. Last %d:", L.out, L.inn, L.bad, n))
+            for i = math.max(1, #L.log - n + 1), #L.log do print("  " .. L.log[i]) end
+        else
+            LX.showSyncLog()
+        end
+    elseif cmd == "syncevery" then
+        local v = arg:lower()
+        local n = tonumber(v)
+        if v == "off" then DB.syncEvery = 0
+        elseif n and n >= 1 and n <= 120 then DB.syncEvery = math.floor(n)
+        elseif v ~= "" then chat("usage: /ledger syncevery <minutes 1-120> or off") return end
+        local e = LX.syncEvery()
+        chat(e > 0 and ("a full sync goes to online linked characters every " .. e .. " minutes (changes are also pushed as they happen).") or "periodic full sync is off (changes are still pushed as they happen).")
+        refreshUI()
+    elseif cmd == "live" then
+        local v = arg:lower()
+        if v == "off" then DB.liveSync = false elseif v == "on" then DB.liveSync = nil end
+        chat("real-time sync is " .. (DB.liveSync == false and "OFF (use /ledger sync by hand)" or "on") .. ".")
     elseif cmd == "links" then
         local any = false
-        for _, display in pairs(DB.trusted) do print("  " .. display) any = true end
+        for lower, display in pairs(DB.trusted) do
+            local at = state.peers[lower]
+            print("  " .. display .. ((at and GetTime() - at < 1200) and "  |cff4dc77f(online)|r" or "  |cff888888(not heard from)|r"))
+            any = true
+        end
         if not any then chat("no linked characters.") end
     elseif cmd == "sync" then
         if syncAll() then chat("sync sent. Linked characters that are online will update.") else chat("nothing to sync with: no characters from another account are linked. (Characters on this account share data automatically.)") end
@@ -3774,6 +4176,7 @@ function handlers.PLAYER_LOGIN()
             DB.chars[old] = nil
         end
     end
+    backfillRealms()
     updateSelf(true)
     -- drop links to characters that live on this account (an earlier version let you add them)
     for lower in pairs(DB.trusted) do
@@ -3790,6 +4193,7 @@ function handlers.PLAYER_LOGIN()
         ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", systemFilter)
     end
     createMinimapButton()
+    LX.live.start()
     if DB.setupDone == nil then
         -- first run on this account: walk the person through setup once.
         -- Accounts that were already configured under an older version are not nagged.
@@ -3928,6 +4332,7 @@ function handlers.OWNED_AUCTIONS_UPDATED() state.ownedLoaded = ahIsOpen() scanAu
 ------------------------------------------------------------------------
 do
 local function safe(tag, fn, ...)
+    if state.leaving then return false end
     local ok, err = pcall(fn, ...)
     if not ok then state.lastError = tag .. ": " .. tostring(err) end
     return ok
@@ -4331,7 +4736,7 @@ function handlers.TIME_PLAYED_MSG(total, level)
     restoreTimePlayedChat()
 end
 
-LX.safe, LX.install, LX.requestPlayed, LX.hooks = safe, installLedgerHooks, requestPlayed, tx.hooks
+LX.safe, LX.install, LX.requestPlayed, LX.hooks, LX.restoreChat = safe, installLedgerHooks, requestPlayed, tx.hooks, restoreTimePlayedChat
 end -- ledger capture
 
 function handlers.PLAYER_LEVEL_UP() updateSelf(false) end
@@ -4344,10 +4749,15 @@ end
 function handlers.CHAT_MSG_ADDON(prefix, msg, channel, sender)
     if prefix ~= PREFIX or channel ~= "WHISPER" or not DB then return end
     local who = trustedKey(normName(sender))
-    if not who then return end
+    if not who then
+        LX.logSync("bad", sender, msg)
+        return
+    end
+    LX.logSync("in", sender, msg)
     local mode, line = msg:match("^(%a)%^(.*)$")
     if not mode then return end
     state.lastSender[who] = sender
+    if LX.live then LX.live.heard(who, sender) end
     if canon(sender):find(" ") then DB.whisperStyle = sender:find(" ") and "space" or "dash" end
     local res = handleLine(line, who)
     if mode == "D" and line:sub(1, 2) == "C^" then
@@ -4360,7 +4770,17 @@ function handlers.CHAT_MSG_ADDON(prefix, msg, channel, sender)
     if res then refreshUI() end
 end
 
+-- Logging out: the game is tearing its data down, so stop touching it. Nothing is read or sent from here
+-- on (the add-on keeps its data up to date while you play, so there is nothing left to save).
+function handlers.PLAYER_LOGOUT()
+    state.leaving = true
+    outq = {}
+    if ticker then pcall(ticker.Cancel, ticker) ticker = nil end
+    LX.restoreChat()
+end
+
 frame:SetScript("OnEvent", function(_, event, ...)
+    if state.leaving then return end
     local h = handlers[event]
     if h then h(...) end
 end)
