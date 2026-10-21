@@ -27,41 +27,32 @@ NOTES
 - Auction sales are logged when you collect the mail.
 - Zone tints on continent maps are rectangles; the game provides no outlines.
 
-CHANGES IN 1.0.1
+
+CHANGES IN 1.0.0
+
 - Forever first + last names: characters are tracked by full name, so two characters sharing a
   first name on one account no longer clash. Existing data moves to the full-name key when you
   log in on each character. Link other-account characters by full name: /ledger link First Last
+
 - /ledger whisperstyle dash|space (default: space, "First Last", as Forever whispers use)
 
-CHANGES IN 1.1.0
 - Ledger now records loot gold and quest reward gold (new Loot and Quest filters).
 
-RENAMED TO FOREVER LEDGER
-The add-on was called Account Ledger. Delete the old AccountLedger folder from Interface/AddOns
-(running both at once makes them fight over /ledger).
-To keep your saved data: before first launch, in your WTF/Account/<ACCOUNT>/SavedVariables folder,
-copy AccountLedger.lua to ForeverLedger.lua. Or, in the old version, /ledger export, then in this
-one /ledger import. Linked characters need linking again, and BOTH accounts must be updated
-(sync messages use a new channel name, so old and new versions cannot talk to each other).
-
-CHANGES IN 1.3.0
 - Faction awareness: every character shows an [A] or [H] tag. Lists (overview, materials, auctions,
   move list, ledger, wealth, playtime) show your logged-in character's faction by default. The faction
   button at the top of the window cycles: your faction / the other faction / both. /ledger faction mine|other|all
 - The move list only suggests moves between same-faction characters (no cross-faction mail or trade).
 
-CHANGES IN 1.4.0
 - Ruleset filter: lists only show characters on your current ruleset (Normal, PvP, RP, Hardcore each
   separate). The ruleset button beside the faction button switches to all rulesets. /ledger ruleset this|all
   The ruleset is taken from the realm name the game reports for each character: run /ledger debug and
   check the "ruleset/realm" line shows a different value per ruleset.
 
-CHANGES IN 1.4.1
+
 - Logout safety: from the moment the game starts logging out/quitting (PLAYER_LOGOUT) the add-on stops
   touching game data, sending sync messages or redrawing, in case that contributed to logout crashes.
 - /ledger debug shows how much data is saved and the add-on's memory use.
 
-CHANGES IN 1.5.0
 - Real-time sync. While a linked character is online, changes (gold, bags, professions, auctions,
   ledger lines, notes, to-dos) are pushed to it automatically, at most every 45 seconds. With nobody
   online, a one-line hello goes out every 3 minutes so a character that logs in later is found fast.
@@ -70,17 +61,17 @@ CHANGES IN 1.5.0
   synced to you once (only one can be online at a time). Give each account its own label in setup
   (they must differ) for this to work.
 
-CHANGES IN 1.5.1
+
 - Ruleset filter now compares the ruleset word in the realm name (Normal/PvE, PvP, RP, Hardcore) instead of
   the exact string, so characters on the same ruleset but with differently named realms (e.g. "PvE 1"
   and "PvE 2") are no longer hidden. /ledger debug lists the realm names it has seen.
 
-CHANGES IN 1.6.0
+
 - Timed full sync: every X minutes (default 5) everything is sent to online linked characters -- every
   character on this account plus notes and to-dos -- on top of the instant change pushes.
   Change X with the Auto-sync button at the bottom of the window, or /ledger syncevery <minutes>|off.
 
-CHANGES IN 1.6.1
+
 - Sync log: every sync message sent or received this session is recorded. "Sync log" button at the bottom
   of the window (or /ledger synclog) shows it in a copyable box; /ledger synclog chat N prints the last N lines
   in chat; /ledger synclog clear empties it. Messages from characters that are not linked are shown as REJECTED.
