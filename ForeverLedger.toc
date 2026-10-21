@@ -1,0 +1,8 @@
+## Interface: 16001, 11509
+## Title: Forever Ledger
+## Notes: Tracks gold, items, professions, auctions, transactions, time played, zone notes and to-dos across all your characters and accounts.
+## Version: 1.2.0
+## SavedVariables: ForeverLedgerDB, AccountLedgerDB
+## IconTexture: Interface\Icons\INV_Misc_Coin_01
+
+ForeverLedger.lua
