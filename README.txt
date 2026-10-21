@@ -17,7 +17,7 @@ WHAT IT DOES
 - Shared to-do list
 
 COMMANDS
-/ledger (or /al, /fl)  open the window
+/ledger (/fl)  open the window
 /ledger help      full command list
 /ledger debug     check hooks and the world map overlay
 /ledger mapoverlay  turn the world map overlay on/off
